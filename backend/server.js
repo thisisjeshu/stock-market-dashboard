@@ -22,16 +22,16 @@ if (!TWELVE_DATA_API_KEY) {
 // ============================================================
 
 let simulationUserStorage = {
-  username: "Simulation_Trader_One",
+  username: 'Simulation_Trader_One',
   cashBalance: 100000.00,
   portfolio: [
     {
-      ticker: "AAPL",
+      ticker: 'AAPL',
       shares: 10,
       avgPrice: 175.50
     },
     {
-      ticker: "NVDA",
+      ticker: 'NVDA',
       shares: 5,
       avgPrice: 850.00
     }
@@ -40,15 +40,6 @@ let simulationUserStorage = {
 
 // ============================================================
 // GLOBAL MARKET WATCHLIST
-// ============================================================
-//
-// These are real securities.
-// Prices are NOT hard-coded.
-// They are retrieved from Twelve Data.
-//
-// You can expand this list later or allow users to search
-// virtually any supported security.
-//
 // ============================================================
 
 const MARKET_WATCHLIST = [
@@ -80,7 +71,20 @@ const MARKET_WATCHLIST = [
 ];
 
 // ============================================================
-// TWELVE DATA REQUEST HELPER
+// MARKET CACHE
+// ============================================================
+
+let marketCache = {};
+let marketCacheTimestamp = 0;
+
+// Refresh Twelve Data only once every 60 seconds.
+const MARKET_CACHE_DURATION = 60 * 1000;
+
+// Prevent multiple simultaneous refreshes.
+let marketRefreshPromise = null;
+
+// ============================================================
+// TWELVE DATA QUOTE
 // ============================================================
 
 async function getQuote(ticker, exchange = '') {
@@ -115,6 +119,67 @@ async function getQuote(ticker, exchange = '') {
 }
 
 // ============================================================
+// REFRESH MARKET CACHE
+// ============================================================
+
+async function refreshMarketCache() {
+  if (marketRefreshPromise) {
+    return marketRefreshPromise;
+  }
+
+  marketRefreshPromise = (async () => {
+    const updatedPrices = { ...marketCache };
+
+    console.log('📡 Refreshing market data from Twelve Data...');
+
+    for (const { ticker, exchange } of MARKET_WATCHLIST) {
+      try {
+        const quote = await getQuote(ticker, exchange);
+
+        const price = parseFloat(
+          quote.close ??
+          quote.price ??
+          quote.last
+        );
+
+        if (!Number.isNaN(price) && price > 0) {
+          updatedPrices[ticker] = price;
+
+          console.log(
+            `✓ ${ticker}: ${price} ${quote.currency || ''}`
+          );
+        }
+      } catch (error) {
+        console.error(
+          `⚠️ Market data error for ${ticker}:`,
+          error.response?.data?.message || error.message
+        );
+
+        // Keep the previous cached price if available.
+        if (marketCache[ticker] !== undefined) {
+          updatedPrices[ticker] = marketCache[ticker];
+        }
+      }
+    }
+
+    marketCache = updatedPrices;
+    marketCacheTimestamp = Date.now();
+
+    console.log(
+      `✅ Market cache updated: ${Object.keys(marketCache).length} symbols`
+    );
+
+    return marketCache;
+  })();
+
+  try {
+    return await marketRefreshPromise;
+  } finally {
+    marketRefreshPromise = null;
+  }
+}
+
+// ============================================================
 // HEALTH CHECK
 // ============================================================
 
@@ -122,72 +187,44 @@ app.get('/', (req, res) => {
   res.json({
     status: 'online',
     service: 'NUMORA PRO Market Engine',
-    marketData: 'Twelve Data'
+    marketData: 'Twelve Data',
+    cacheDuration: '60 seconds'
   });
 });
 
 // ============================================================
 // MARKET FEED
 // ============================================================
-//
-// Returns real market prices for the dashboard watchlist.
-//
-// Frontend-compatible response:
-//
-// {
-//   AAPL: 237.12,
-//   TSLA: 321.45,
-//   NVDA: 178.22
-// }
-//
-// ============================================================
 
 app.get('/api/stocks/market-feed', async (req, res) => {
   try {
-    const results = {};
+    const cacheExpired =
+      Date.now() - marketCacheTimestamp >= MARKET_CACHE_DURATION;
 
-    await Promise.all(
-      MARKET_WATCHLIST.map(async ({ ticker, exchange }) => {
-        try {
-          const quote = await getQuote(ticker, exchange);
+    if (cacheExpired || Object.keys(marketCache).length === 0) {
+      await refreshMarketCache();
+    }
 
-          const price = parseFloat(
-            quote.close ??
-            quote.price ??
-            quote.last
-          );
-
-          if (!Number.isNaN(price)) {
-            results[ticker] = price;
-          }
-        } catch (error) {
-          console.error(
-            `Market data error for ${ticker}:`,
-            error.message
-          );
-        }
-      })
-    );
-
-    res.json(results);
+    res.json(marketCache);
 
   } catch (error) {
-    console.error('Market feed error:', error.message);
+    console.error(
+      'Market feed error:',
+      error.response?.data?.message || error.message
+    );
+
+    if (Object.keys(marketCache).length > 0) {
+      return res.json(marketCache);
+    }
 
     res.status(500).json({
-      error: 'Unable to retrieve live market data.'
+      error: 'Unable to retrieve market data.'
     });
   }
 });
 
 // ============================================================
 // SINGLE STOCK QUOTE
-// ============================================================
-//
-// Example:
-//
-// /api/stocks/quote?symbol=AAPL&exchange=NASDAQ
-//
 // ============================================================
 
 app.get('/api/stocks/quote', async (req, res) => {
@@ -208,26 +245,21 @@ app.get('/api/stocks/quote', async (req, res) => {
     res.json(quote);
 
   } catch (error) {
-    console.error('Quote error:', error.message);
+    console.error(
+      'Quote error:',
+      error.response?.data?.message || error.message
+    );
 
     res.status(500).json({
       error: 'Unable to retrieve stock quote.',
-      details: error.message
+      details:
+        error.response?.data?.message || error.message
     });
   }
 });
 
 // ============================================================
 // STOCK SEARCH
-// ============================================================
-//
-// Example:
-//
-// /api/stocks/search?q=tesla
-//
-// This allows NUMORA to search for securities instead of
-// maintaining a hard-coded list forever.
-//
 // ============================================================
 
 app.get('/api/stocks/search', async (req, res) => {
@@ -260,7 +292,10 @@ app.get('/api/stocks/search', async (req, res) => {
     res.json(response.data);
 
   } catch (error) {
-    console.error('Symbol search error:', error.message);
+    console.error(
+      'Symbol search error:',
+      error.response?.data?.message || error.message
+    );
 
     res.status(500).json({
       error: 'Unable to search market securities.'
@@ -288,10 +323,11 @@ app.post('/api/trade/execute', async (req, res) => {
       type
     } = req.body;
 
+    const normalizedTicker = ticker?.toUpperCase();
     const targetShares = parseInt(shares);
 
     if (
-      !ticker ||
+      !normalizedTicker ||
       Number.isNaN(targetShares) ||
       targetShares <= 0
     ) {
@@ -300,27 +336,29 @@ app.post('/api/trade/execute', async (req, res) => {
       });
     }
 
-    // --------------------------------------------------------
-    // IMPORTANT:
-    // Do NOT trust a price sent by the React frontend.
-    // Retrieve the current market price from the backend.
-    // --------------------------------------------------------
+    // Never trust a frontend price.
+    const cachedPrice = marketCache[normalizedTicker];
 
-    let quote;
+    let executionPrice = cachedPrice;
+    let quote = null;
 
-    try {
-      quote = await getQuote(ticker.toUpperCase());
-    } catch (error) {
-      return res.status(502).json({
-        error: 'Unable to obtain current market price.'
-      });
+    // Use the cache when available.
+    // Otherwise retrieve a fresh quote.
+    if (!executionPrice) {
+      try {
+        quote = await getQuote(normalizedTicker);
+      } catch (error) {
+        return res.status(502).json({
+          error: 'Unable to obtain current market price.'
+        });
+      }
+
+      executionPrice = parseFloat(
+        quote.close ??
+        quote.price ??
+        quote.last
+      );
     }
-
-    const executionPrice = parseFloat(
-      quote.close ??
-      quote.price ??
-      quote.last
-    );
 
     if (
       Number.isNaN(executionPrice) ||
@@ -330,8 +368,6 @@ app.post('/api/trade/execute', async (req, res) => {
         error: 'Market provider returned an invalid price.'
       });
     }
-
-    const normalizedTicker = ticker.toUpperCase();
 
     const transactionTotalCost =
       executionPrice * targetShares;
@@ -431,7 +467,7 @@ app.post('/api/trade/execute', async (req, res) => {
     }
 
     // ========================================================
-    // RETURN UPDATED ACCOUNT
+    // RESPONSE
     // ========================================================
 
     res.json({
@@ -442,8 +478,8 @@ app.post('/api/trade/execute', async (req, res) => {
         type,
         executionPrice,
         total: transactionTotalCost,
-        currency: quote.currency || null,
-        exchange: quote.exchange || null,
+        currency: quote?.currency || null,
+        exchange: quote?.exchange || null,
         timestamp: new Date().toISOString()
       }
     });
@@ -472,5 +508,9 @@ app.listen(PORT, () => {
 
   console.log(
     `📡 Market provider: Twelve Data`
+  );
+
+  console.log(
+    `💾 Market cache duration: ${MARKET_CACHE_DURATION / 1000}s`
   );
 });
